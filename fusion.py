@@ -1,6 +1,7 @@
 # Copyright (c) 2018 Andy Zeng
 
 import numpy as np
+import trimesh
 
 from numba import njit, prange
 from skimage import measure
@@ -429,3 +430,12 @@ def pcwrite(filename, xyzrgb):
             xyz[i, 0], xyz[i, 1], xyz[i, 2],
             rgb[i, 0], rgb[i, 1], rgb[i, 2],
         ))
+
+
+def meshwrite_trimesh(filename, verts, faces):
+    """Save a 3D mesh to a polygon .ply file using trimesh.
+    """
+    # 创建 trimesh 对象
+    mesh = trimesh.Trimesh(vertices=verts, faces=faces)
+    # 保存为 .ply 文件（trimesh 会自动处理格式）
+    mesh.export(filename, file_type='ply')

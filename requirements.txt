@@ -2,6 +2,7 @@ numpy==1.21.6
 opencv-python
 scikit-image==0.18.3
 numba==0.56.4
+trimesh
 
 # Optional
 pycuda
