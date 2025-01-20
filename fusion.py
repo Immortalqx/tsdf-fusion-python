@@ -173,15 +173,21 @@ class TSDFVolume:
             ], axis=0).astype(int).T
 
     @staticmethod
-    @njit(parallel=True)
+    @njit(parallel=True)  # 使用 numba 的 JIT 编译器加速函数执行，并支持并行处理
     def vox2world(vol_origin, vox_coords, vox_size):
         """Convert voxel grid coordinates to world coordinates.
         """
+        # 确保输入参数为np.float32，以提高计算效率
         vol_origin = vol_origin.astype(np.float32)
         vox_coords = vox_coords.astype(np.float32)
+
+        # 初始化一个与体素坐标大小相同的空数组，用于存储转换后的世界坐标
         cam_pts = np.empty_like(vox_coords, dtype=np.float32)
-        for i in prange(vox_coords.shape[0]):
-            for j in range(3):
+
+        # 并行遍历每个体素坐标，将其转换为世界坐标
+        for i in prange(vox_coords.shape[0]):  # 使用 prange 进行并行处理
+            for j in range(3):  # 遍历 x, y, z 三个坐标分量
+                # 世界坐标 = 原点 + (体素大小 * 体素坐标)
                 cam_pts[i, j] = vol_origin[j] + (vox_size * vox_coords[i, j])
         return cam_pts
 
@@ -190,12 +196,20 @@ class TSDFVolume:
     def cam2pix(cam_pts, intr):
         """Convert camera coordinates to pixel coordinates.
         """
+        # 提取相机内参矩阵中的焦距 (fx, fy) 和主点坐标 (cx, cy)
         intr = intr.astype(np.float32)
         fx, fy = intr[0, 0], intr[1, 1]
         cx, cy = intr[0, 2], intr[1, 2]
+
+        # 初始化像素坐标数组，存储每个点的像素坐标 [u, v]
         pix = np.empty((cam_pts.shape[0], 2), dtype=np.int64)
+
+        # 并行处理每个点，计算像素坐标
         for i in prange(cam_pts.shape[0]):
+            # 使用相机内参公式将相机坐标转换为像素坐标
+            # u = (x * fx / z) + cx
             pix[i, 0] = int(np.round((cam_pts[i, 0] * fx / cam_pts[i, 2]) + cx))
+            # v = (y * fy / z) + cy
             pix[i, 1] = int(np.round((cam_pts[i, 1] * fy / cam_pts[i, 2]) + cy))
         return pix
 
@@ -204,11 +218,18 @@ class TSDFVolume:
     def integrate_tsdf(tsdf_vol, dist, w_old, obs_weight):
         """Integrate the TSDF volume.
         """
-        tsdf_vol_int = np.empty_like(tsdf_vol, dtype=np.float32)
-        w_new = np.empty_like(w_old, dtype=np.float32)
+        # 初始化结果数组
+        tsdf_vol_int = np.empty_like(tsdf_vol, dtype=np.float32)  # 存储融合后的 TSDF 值
+        w_new = np.empty_like(w_old, dtype=np.float32)  # 存储融合后的权重
+
+        # 并行处理每个体素，融合 TSDF 值和权重
         for i in prange(len(tsdf_vol)):
+            # 新的权重等于旧权重加上当前观测的权重
             w_new[i] = w_old[i] + obs_weight
+            # 使用加权平均融合 TSDF 值
+            # tsdf_vol_int = (旧权重 * 旧 TSDF + 新权重 * 新 TSDF) / 总权重
             tsdf_vol_int[i] = (w_old[i] * tsdf_vol[i] + obs_weight * dist[i]) / w_new[i]
+
         return tsdf_vol_int, w_new
 
     def integrate(self, color_im, depth_im, cam_intr, cam_pose, obs_weight=1.):
@@ -256,47 +277,73 @@ class TSDFVolume:
                                      )
         else:  # CPU mode: integrate voxel volume (vectorized implementation)
             # Convert voxel grid coordinates to pixel coordinates
+            # Step 1: 将体素坐标转换为相机坐标
+            # 将体素网格坐标从体素空间转换为世界坐标系
             cam_pts = self.vox2world(self._vol_origin, self.vox_coords, self._voxel_size)
+            # 使用相机的逆位姿矩阵，将世界坐标点转换到相机坐标系
             cam_pts = rigid_transform(cam_pts, np.linalg.inv(cam_pose))
+            # 体素点在相机坐标系中的深度值（Z 坐标）
             pix_z = cam_pts[:, 2]
+            # 使用相机内参将相机坐标转换为像素坐标
             pix = self.cam2pix(cam_pts, cam_intr)
             pix_x, pix_y = pix[:, 0], pix[:, 1]
 
             # Eliminate pixels outside view frustum
+            # Step 2: 剔除视锥外的像素
+            # 检查像素是否在图像范围内，确保其在有效的视锥内
             valid_pix = np.logical_and(pix_x >= 0,
                                        np.logical_and(pix_x < im_w,
                                                       np.logical_and(pix_y >= 0,
                                                                      np.logical_and(pix_y < im_h,
                                                                                     pix_z > 0))))
+            # 创建一个与像素数量相同的深度值数组
             depth_val = np.zeros(pix_x.shape)
+            # 对于有效像素，提取深度图中的深度值
             depth_val[valid_pix] = depth_im[pix_y[valid_pix], pix_x[valid_pix]]
 
             # Integrate TSDF
+            # Step 3: 更新 TSDF（有符号距离函数）
+            # 计算深度图中的深度值与体素点相机坐标中的深度值的差值
             depth_diff = depth_val - pix_z
+            # 仅保留深度值大于 0 且差值在截断范围内的点
             valid_pts = np.logical_and(depth_val > 0, depth_diff >= -self._trunc_margin)
+            # 计算 TSDF 值，将差值归一化到 [-1, 1]，并截断到 1
             dist = np.minimum(1, depth_diff / self._trunc_margin)
+
+            # Step 4: 融合有效的 TSDF 值
+            # 获取有效体素点的 (x, y, z) 索引
             valid_vox_x = self.vox_coords[valid_pts, 0]
             valid_vox_y = self.vox_coords[valid_pts, 1]
             valid_vox_z = self.vox_coords[valid_pts, 2]
+            # 提取有效体素的原始权重和 TSDF 值
             w_old = self._weight_vol_cpu[valid_vox_x, valid_vox_y, valid_vox_z]
             tsdf_vals = self._tsdf_vol_cpu[valid_vox_x, valid_vox_y, valid_vox_z]
             valid_dist = dist[valid_pts]
+            # 融合 TSDF 值和权重
             tsdf_vol_new, w_new = self.integrate_tsdf(tsdf_vals, valid_dist, w_old, obs_weight)
+            # 更新权重和 TSDF 值
             self._weight_vol_cpu[valid_vox_x, valid_vox_y, valid_vox_z] = w_new
             self._tsdf_vol_cpu[valid_vox_x, valid_vox_y, valid_vox_z] = tsdf_vol_new
 
             # Integrate color
+            # Step 5: 融合颜色信息
+            # 提取体素的原始颜色值
             old_color = self._color_vol_cpu[valid_vox_x, valid_vox_y, valid_vox_z]
+            # 将颜色解码为 R、G、B 三个分量
             old_b = np.floor(old_color / self._color_const)
             old_g = np.floor((old_color - old_b * self._color_const) / 256)
             old_r = old_color - old_b * self._color_const - old_g * 256
+            # 获取深度图对应的颜色
             new_color = color_im[pix_y[valid_pts], pix_x[valid_pts]]
+            # 将新的颜色值解码为 R、G、B 分量
             new_b = np.floor(new_color / self._color_const)
             new_g = np.floor((new_color - new_b * self._color_const) / 256)
             new_r = new_color - new_b * self._color_const - new_g * 256
+            # 根据 TSDF 权重更新颜色分量，使用加权平均方法
             new_b = np.minimum(255., np.round((w_old * old_b + obs_weight * new_b) / w_new))
             new_g = np.minimum(255., np.round((w_old * old_g + obs_weight * new_g) / w_new))
             new_r = np.minimum(255., np.round((w_old * old_r + obs_weight * new_r) / w_new))
+            # 将更新后的 RGB 分量重新编码并存储
             self._color_vol_cpu[valid_vox_x, valid_vox_y, valid_vox_z] = new_b * self._color_const + new_g * 256 + new_r
 
     def get_volume(self):
@@ -349,24 +396,41 @@ class TSDFVolume:
 def rigid_transform(xyz, transform):
     """Applies a rigid transform to an (N, 3) pointcloud.
     """
+    # 将点云扩展为齐次坐标形式 (N, 4)，增加一列 1 表示齐次坐标的第 4 维
     xyz_h = np.hstack([xyz, np.ones((len(xyz), 1), dtype=np.float32)])
+    # 应用刚体变换矩阵，将点云从一个坐标系变换到另一个坐标系
     xyz_t_h = np.dot(transform, xyz_h.T).T
+    # 提取变换后的前三列 [x', y', z']，对应新的点云坐标
     return xyz_t_h[:, :3]
 
 
 def get_view_frustum(depth_im, cam_intr, cam_pose):
     """Get corners of 3D camera view frustum of depth image
     """
-    im_h = depth_im.shape[0]
-    im_w = depth_im.shape[1]
+    # 获取深度图像的高度和宽度
+    im_h = depth_im.shape[0]  # 图像高度（像素行数）
+    im_w = depth_im.shape[1]  # 图像宽度（像素列数）
+
+    # 获取深度图像中的最大深度值（视锥的最大深度范围）
     max_depth = np.max(depth_im)
+
+    # 计算视锥角点在相机坐标系中的坐标
+    # 角点包括：相机原点 (0, 0, 0)，图像四个边角点 (左上、右上、左下、右下) 对应的最大深度点
     view_frust_pts = np.array([
-        (np.array([0, 0, 0, im_w, im_w]) - cam_intr[0, 2]) * np.array([0, max_depth, max_depth, max_depth, max_depth]) /
-        cam_intr[0, 0],
-        (np.array([0, 0, im_h, 0, im_h]) - cam_intr[1, 2]) * np.array([0, max_depth, max_depth, max_depth, max_depth]) /
-        cam_intr[1, 1],
+        # x 坐标 (像素列坐标 - 主点列坐标) * 深度 / 焦距
+        (np.array([0, 0, 0, im_w, im_w]) - cam_intr[0, 2]) *
+        np.array([0, max_depth, max_depth, max_depth, max_depth]) / cam_intr[0, 0],
+
+        # y 坐标 (像素行坐标 - 主点行坐标) * 深度 / 焦距
+        (np.array([0, 0, im_h, 0, im_h]) - cam_intr[1, 2]) *
+        np.array([0, max_depth, max_depth, max_depth, max_depth]) / cam_intr[1, 1],
+
+        # z 坐标
         np.array([0, max_depth, max_depth, max_depth, max_depth])
     ])
+
+    # 将视锥角点从相机坐标系转换到世界坐标系
+    # 使用刚体变换函数 rigid_transform，输入点为 (3, 5)，先转置为 (5, 3)，然后再转置回来
     view_frust_pts = rigid_transform(view_frust_pts.T, cam_pose).T
     return view_frust_pts
 
